@@ -5,11 +5,19 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
 import os
+import secrets
+import time
 from pathlib import Path
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +26,110 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+teachers_file = Path(os.environ.get("TEACHERS_FILE", current_dir / "teachers.json"))
+session_https_only = os.environ.get("SESSION_HTTPS_ONLY", "false").lower() in {
+    "1", "true", "yes"
+}
+session_cookie = "teacher_session"
+session_max_age = 8 * 60 * 60
+teacher_sessions: dict[str, tuple[str, float]] = {}
+
+
+class TeacherLogin(BaseModel):
+    username: str
+    password: str
+
+
+def get_session_teacher(request: Request) -> Optional[str]:
+    token = request.cookies.get(session_cookie)
+    if not token:
+        return None
+
+    session_id = hashlib.sha256(token.encode()).hexdigest()
+    session = teacher_sessions.get(session_id)
+    if session is None:
+        return None
+    username, expires_at = session
+    if expires_at <= time.time():
+        teacher_sessions.pop(session_id, None)
+        return None
+    return username
+
+
+def require_teacher(request: Request) -> str:
+    username = get_session_teacher(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+@app.post("/auth/login")
+def teacher_login(credentials: TeacherLogin, response: Response):
+    try:
+        with teachers_file.open(encoding="utf-8") as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher accounts are not configured",
+        )
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher account configuration is unavailable",
+        )
+
+    teachers = config.get("teachers") if isinstance(config, dict) else None
+    if not isinstance(teachers, dict):
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher account configuration is invalid",
+        )
+
+    stored_password = teachers.get(credentials.username)
+    if not isinstance(stored_password, str) or not hmac.compare_digest(
+        stored_password, credentials.password
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    session_id = hashlib.sha256(token.encode()).hexdigest()
+    teacher_sessions[session_id] = (
+        credentials.username,
+        time.time() + session_max_age,
+    )
+    response.set_cookie(
+        session_cookie,
+        token,
+        max_age=session_max_age,
+        httponly=True,
+        secure=session_https_only,
+        samesite="lax",
+        path="/",
+    )
+    return {"username": credentials.username}
+
+
+@app.get("/auth/me")
+def get_teacher_session(request: Request):
+    username = get_session_teacher(request)
+    return {"authenticated": bool(username), "username": username}
+
+
+@app.post("/auth/logout")
+def teacher_logout(request: Request, response: Response):
+    token = request.cookies.get(session_cookie)
+    if token:
+        session_id = hashlib.sha256(token.encode()).hexdigest()
+        teacher_sessions.pop(session_id, None)
+    response.delete_cookie(
+        session_cookie,
+        secure=session_https_only,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return {"authenticated": False}
 
 # In-memory activity database
 activities = {
@@ -89,7 +201,11 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    teacher: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +227,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    teacher: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
